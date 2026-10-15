@@ -2,8 +2,9 @@ import streamlit as st
 import fitz  # PyMuPDF
 import numpy as np
 import faiss
+import torch
 from sentence_transformers import SentenceTransformer
-from transformers import pipeline
+from transformers import AutoTokenizer, AutoModelForQuestionAnswering
 from groq import Groq
 
 # 1. Page Configuration
@@ -13,19 +14,54 @@ st.set_page_config(
     layout="wide"
 )
 
-# 2. Load Embedding & Local QA Models (Cached in memory)
+# 2. Load Embedding & Local QA Models (Compatible with Transformers v5+)
 @st.cache_resource
 def load_rag_models():
     # Compact ~80MB embedding model for semantic vector search
     embedder = SentenceTransformer("all-MiniLM-L6-v2")
-    # Built-in Extractive QA model so the app works immediately without requiring an API key
-    qa_pipe = pipeline(
-        "question-answering",
-        model="distilbert-base-cased-distilled-squad"
-    )
-    return embedder, qa_pipe
+    # Load Extractive QA Tokenizer & Model directly (bypasses deprecated v5 pipeline wrapper)
+    qa_model_name = "distilbert-base-cased-distilled-squad"
+    tokenizer = AutoTokenizer.from_pretrained(qa_model_name)
+    qa_model = AutoModelForQuestionAnswering.from_pretrained(qa_model_name)
+    qa_model.eval()
+    return embedder, tokenizer, qa_model
 
-embedder, qa_pipe = load_rag_models()
+embedder, tokenizer, qa_model = load_rag_models()
+
+def extract_answer_from_chunk(question, context):
+    inputs = tokenizer(question, context, return_tensors="pt", truncation=True, max_length=512)
+    with torch.no_grad():
+        outputs = qa_model(**inputs)
+
+    start_logits = outputs.start_logits[0].clone()
+    end_logits = outputs.end_logits[0].clone()
+
+    # Mask out question tokens and special tokens so the answer only comes from the PDF context
+    seq_ids = inputs.sequence_ids(0)
+    for i, s_id in enumerate(seq_ids):
+        if s_id != 1:
+            start_logits[i] = -1e9
+            end_logits[i] = -1e9
+
+    start_probs = torch.softmax(start_logits, dim=-1)
+    end_probs = torch.softmax(end_logits, dim=-1)
+
+    best_score = -1.0
+    best_start, best_end = 0, 0
+    for s in range(len(start_probs)):
+        if seq_ids[s] != 1:
+            continue
+        for e in range(s, min(s + 30, len(end_probs))):
+            if seq_ids[e] != 1:
+                break
+            score = float(start_probs[s] * end_probs[e])
+            if score > best_score:
+                best_score = score
+                best_start, best_end = s, e
+
+    answer_ids = inputs["input_ids"][0][best_start : best_end + 1]
+    answer = tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
+    return answer, best_score
 
 # 3. Built-in Sample Technical Datasheet (For 1-Click Recruiter Testing)
 def get_sample_datasheet_pages():
@@ -184,7 +220,7 @@ if q_col1.button("⚡ Max voltage on Pin 4?", use_container_width=True):
 if q_col2.button("🌡️ When does thermal shutdown trigger?", use_container_width=True):
     preset_query = "At what temperature does thermal shutdown trigger?"
 if q_col3.button("🔌 What pull-up resistors are needed for I2C?", use_container_width=True):
-    preset_query = "What pull-up resistors and clock frequencies are supported for I2C?"
+    preset_query = "What pull-up resistors are required on the SDA and SCL lines?"
 
 # 8. RAG Retrieval + Answer Generation Function
 def answer_question(query):
@@ -234,15 +270,15 @@ def answer_question(query):
     best_chunk = retrieved[0]
 
     for r in retrieved:
-        res = qa_pipe(question=query, context=r["text"])
-        if res["score"] > best_conf:
-            best_conf = res["score"]
-            best_ans = res["answer"]
+        ans, conf = extract_answer_from_chunk(query, r["text"])
+        if conf > best_conf and ans:
+            best_conf = conf
+            best_ans = ans
             best_chunk = r
 
     answer_text = (
-        f"**Direct Answer:** {best_ans} *( cited from **[Page {best_chunk['page']}]** | "
-        f"Confidence: `{best_conf:.2f}` )*\n\n"
+        f"**Direct Answer:** {best_ans} *(cited from **[Page {best_chunk['page']}]** | "
+        f"Confidence: `{best_conf:.2f}`)*\n\n"
         f"> **Supporting Excerpt [Page {best_chunk['page']}]:** \"{best_chunk['text']}\""
     )
     return answer_text, retrieved
